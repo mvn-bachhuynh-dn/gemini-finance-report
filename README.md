@@ -47,6 +47,24 @@ No VM, VPS, or paid hosting required.
 
 ---
 
+## 📁 Folder Structure
+
+```bash
+gemini-finance-bot/
+├── README.md
+├── LICENSE
+├── src/
+│   ├── gemini-bot.en.gs
+│   └── gemini-bot.vi.gs
+├── assets/
+│   ├── demo-telegram.png
+│   ├── sheet-sample.png
+│   └── setup-guide.png
+└── .gitignore
+```
+
+---
+
 ## 🚀 How to Deploy
 
 ### 1️⃣ Create a Telegram Bot
@@ -206,24 +224,6 @@ In **Apps Script → Triggers (⏰ icon)**, add these:
 🟢 Balance: +7,250,000₫
 
 Nice budgeting today! 🎯
-```
-
----
-
-## 📁 Folder Structure
-
-```bash
-gemini-finance-bot/
-├── README.md
-├── LICENSE
-├── src/
-│   ├── gemini-bot.en.gs
-│   └── gemini-bot.vi.gs
-├── assets/
-│   ├── demo-telegram.png
-│   ├── sheet-sample.png
-│   └── setup-guide.png
-└── .gitignore
 ```
 
 ---
