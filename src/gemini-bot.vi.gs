@@ -19,10 +19,32 @@ function doPost(e) {
     if (!msg || msg.from?.is_bot) return HtmlService.createHtmlOutput("ignored");
 
     const chatId = msg.chat.id;
-    const text = msg.text?.trim();
-    if (!text) return HtmlService.createHtmlOutput("no text");
+    let text = msg.text?.trim();
+    let imageBlob = null;
+
+    Logger.log(`Received message from ${chatId}. Text: "${text}". Photo present: ${!!msg.photo}`);
+
+    // Check for photo
+    if (msg.photo && msg.photo.length > 0) {
+      // Get the largest photo
+      const photoId = msg.photo[msg.photo.length - 1].file_id;
+      Logger.log(`Found photo with ID: ${photoId}`);
+      imageBlob = getTelegramFile(photoId);
+      if (!imageBlob) {
+        sendMessage(chatId, "⚠️ Lỗi: Không thể tải ảnh từ Telegram. Vui lòng thử lại.");
+        return HtmlService.createHtmlOutput("image download failed");
+      }
+      Logger.log(`Image blob retrieved: ${imageBlob ? imageBlob.getContentType() : "null"}`);
+      if (!text) text = msg.caption || "Phân tích ảnh này";
+    }
+
+    if (!text && !imageBlob) {
+      Logger.log("No text and no image blob found. Exiting.");
+      return HtmlService.createHtmlOutput("no content");
+    }
 
     const command = text.split('@')[0].toLowerCase();
+    Logger.log(`Command detected: ${command}`);
 
     // =====================================================
     // BASIC COMMANDS
@@ -95,19 +117,60 @@ function doPost(e) {
     // =====================================================
     // AI-BASED TRANSACTION PARSING (GEMINI)
     // =====================================================
-    const parsed = parseAndReactWithGemini(text, msg.from.first_name || "Người dùng");
-    if (!parsed?.amount || !parsed?.type) {
-      sendMessage(chatId, "🤔 Tôi chưa hiểu rõ giao dịch này, bạn thử diễn đạt khác nhé?");
-      return HtmlService.createHtmlOutput("unclear");
+    const parsed = parseAndReactWithGemini(text, msg.from.first_name || "Người dùng", imageBlob);
+    
+    // Debug: If parsed has error or raw, show it
+    if (parsed.error) {
+       const safeError = (parsed.error || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+       const safeRaw = (parsed.raw || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+       sendMessage(chatId, `⚠️ <b>Lỗi xử lý AI:</b>\n${safeError}\n\n<b>Raw Output:</b>\n<pre>${safeRaw}</pre>`, "HTML");
+       return HtmlService.createHtmlOutput("ai error");
     }
 
-    appendToSheet(parsed, msg.from.first_name || "User");
-    const reply = `✅ Đã ghi: <b>${parsed.type}</b> ${parsed.amount.toLocaleString()}đ — ${parsed.note || ""}\n🏷️ Danh mục: <b>${parsed.category || "Khác"}</b>\n\n${parsed.reaction}`;
-    sendMessage(chatId, reply, "HTML");
-    return HtmlService.createHtmlOutput("ok");
+    // Dispatch based on intent
+    const intent = parsed.intent;
+    const data = parsed.data || {};
+
+    // --- CASE 1: REPORT ---
+    if (intent === "report") {
+      let reportContent = "";
+      switch (data.report_type) {
+        case "day": reportContent = getFinanceReport("day"); break;
+        case "month": reportContent = getFinanceReport("month"); break;
+        case "category": reportContent = getCategoryReport(); break;
+        case "top_category": reportContent = getTopCategoryReport(); break;
+        default: reportContent = getFinanceReport("all"); break;
+      }
+      sendMessage(chatId, `${parsed.reaction}\n\n${reportContent}`, "HTML");
+      return HtmlService.createHtmlOutput("ok report");
+    }
+
+    // --- CASE 2: TRANSACTION ---
+    if (intent === "transaction") {
+      if (!data.amount || !data.type) {
+         sendMessage(chatId, "🤔 Hình như bạn muốn ghi giao dịch nhưng mình chưa rõ số tiền. Bạn nói lại rõ hơn nhé?");
+         return HtmlService.createHtmlOutput("transaction unclear");
+      }
+      appendToSheet(data, msg.from.first_name || "User");
+      const reply = `✅ Đã ghi: <b>${data.type}</b> ${data.amount.toLocaleString()}đ — ${data.note || ""}\n🏷️ Danh mục: <b>${data.category || "Khác"}</b>\n\n${parsed.reaction}`;
+      sendMessage(chatId, reply, "HTML");
+      return HtmlService.createHtmlOutput("ok transaction");
+    }
+
+    // --- CASE 3: CHAT / OTHER ---
+    // Default to just sending the reaction
+    sendMessage(chatId, parsed.reaction || "Mình đang lắng nghe đây! 😄", "HTML");
+    return HtmlService.createHtmlOutput("ok chat");
 
   } catch (err) {
     Logger.log("Error: " + err);
+    try {
+      const update = JSON.parse(e.postData.contents);
+      const chatId = update.message.chat.id;
+      sendMessage(chatId, `🔥 <b>Lỗi hệ thống:</b>\n${err.toString()}`, "HTML");
+    } catch (e2) {
+      Logger.log("Could not send error to user: " + e2);
+    }
     return HtmlService.createHtmlOutput("error");
   }
 }
@@ -115,38 +178,140 @@ function doPost(e) {
 // =====================================================
 // GEMINI PARSER HANDLER
 // =====================================================
-function parseAndReactWithGemini(text, userName) {
+function parseAndReactWithGemini(text, userName, imageBlob = null) {
+  Logger.log(`parseAndReactWithGemini called. User: ${userName}, Text: ${text}, Has Image: ${!!imageBlob}`);
   try {
     const prompt = `
-Bạn là trợ lý tài chính cá nhân thân thiện, có khả năng phân loại chi tiêu.
-Phân tích câu người dùng nhập về chi tiêu hoặc thu nhập.
-Trả về JSON theo mẫu:
+Bạn là "Bot Chi Tiêu Gemini", một trợ lý tài chính cá nhân thông minh, vui tính và hữu ích.
+Nhiệm vụ của bạn là phân tích tin nhắn của người dùng (và ảnh nếu có) để xác định xem họ muốn:
+1. Ghi chép giao dịch (thu/chi).
+2. Xem báo cáo tài chính.
+3. Trò chuyện xã giao bình thường.
+
+Trả về kết quả dưới dạng JSON KHÔNG CÓ MARKDOWN (không dùng \`\`\`json).
+Cấu trúc JSON yêu cầu:
+
 {
-  "type": "thu" hoặc "chi",
-  "amount": số tiền (VNĐ, integer),
-  "note": "mô tả ngắn",
-  "category": "danh mục (ví dụ: Ăn uống, Di chuyển, Giải trí, Hóa đơn, Mua sắm, Sức khỏe, Khác)",
-  "reaction": "một câu phản hồi tự nhiên, vui vẻ, thân mật, có emoji"
+  "intent": "transaction" | "report" | "chat",
+  "data": {
+     // NẾU intent = "transaction":
+     "type": "thu" hoặc "chi",
+     "amount": số tiền (VNĐ, integer),
+     "note": "mô tả ngắn gọn nội dung chi tiêu",
+     "category": "danh mục (Ăn uống, Di chuyển, Mua sắm, Hóa đơn, Giải trí, Sức khỏe, Giáo dục, Đầu tư, Khác)"
+
+     // NẾU intent = "report":
+     "report_type": "day" | "month" | "all" | "category" | "top_category" (dựa vào ngữ cảnh thời gian user hỏi)
+  },
+  "reaction": "Câu trả lời của bạn với người dùng. Nếu là chat thì trả lời tự nhiên. Nếu là giao dịch/report thì trả lời xác nhận vui vẻ. Dùng nhiều emoji."
 }
+
 Câu của người dùng: "${text}"
 Tên người dùng: "${userName}"
 `;
 
     const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_KEY}`;
+    
+    let payload = {
+      contents: [{
+        parts: [{ text: prompt }]
+      }]
+    };
+
+    if (imageBlob) {
+      Logger.log("Adding image to payload...");
+      payload.contents[0].parts.push({
+        inline_data: {
+          mime_type: imageBlob.getContentType(),
+          data: Utilities.base64Encode(imageBlob.getBytes())
+        }
+      });
+    }
+
+    Logger.log("Sending request to Gemini...");
     const res = UrlFetchApp.fetch(url, {
       method: "post",
       contentType: "application/json",
-      payload: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+      payload: JSON.stringify(payload),
       muteHttpExceptions: true,
     });
 
-    const data = JSON.parse(res.getContentText());
-    const raw = data?.candidates?.[0]?.content?.parts?.[0]?.text || "{}";
-    return JSON.parse(raw.replace(/```json|```/g, '').trim());
+    const responseCode = res.getResponseCode();
+    const contentText = res.getContentText();
+    Logger.log(`Gemini response code: ${responseCode}`);
+    Logger.log(`Gemini response body: ${contentText}`);
+
+    if (responseCode !== 200) {
+      return { error: `API Error: ${responseCode}`, raw: contentText };
+    }
+
+    const data = JSON.parse(contentText);
+    const raw = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+    
+    if (!raw) {
+       return { error: "No content in candidate", raw: contentText };
+    }
+
+    Logger.log(`Raw extracted text: ${raw}`);
+    
+    let jsonString = raw;
+    
+    // Try to extract JSON from code block
+    const codeBlockMatch = raw.match(/```json([\s\S]*?)```/);
+    if (codeBlockMatch && codeBlockMatch[1]) {
+      jsonString = codeBlockMatch[1];
+    } else {
+      // Fallback: Find first '{' and last '}'
+      const firstBrace = raw.indexOf('{');
+      const lastBrace = raw.lastIndexOf('}');
+      if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+        jsonString = raw.substring(firstBrace, lastBrace + 1);
+      }
+    }
+
+    try {
+      return JSON.parse(jsonString.trim());
+    } catch (parseErr) {
+      return { error: "JSON Parse Error: " + parseErr.message, raw: raw };
+    }
   } catch (e) {
     Logger.log("Gemini parse error: " + e);
-    return {};
+    return { error: "Exception: " + e.toString(), raw: "Check logs" };
   }
+}
+
+function getTelegramFile(fileId) {
+  Logger.log(`getTelegramFile called for ID: ${fileId}`);
+  try {
+    const url = `${TG_API}/getFile?file_id=${fileId}`;
+    const res = UrlFetchApp.fetch(url);
+    const data = JSON.parse(res.getContentText());
+    if (data.ok) {
+      const filePath = data.result.file_path;
+      Logger.log(`File path retrieved: ${filePath}`);
+      const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
+      const blob = UrlFetchApp.fetch(fileUrl).getBlob();
+      
+      // Fix MIME type if it is generic
+      if (blob.getContentType() === "application/octet-stream") {
+        if (filePath.endsWith(".jpg") || filePath.endsWith(".jpeg")) {
+          blob.setContentType("image/jpeg");
+        } else if (filePath.endsWith(".png")) {
+          blob.setContentType("image/png");
+        } else if (filePath.endsWith(".webp")) {
+          blob.setContentType("image/webp");
+        }
+      }
+      
+      Logger.log(`Blob retrieved. Size: ${blob.getBytes().length}, Type: ${blob.getContentType()}`);
+      return blob;
+    } else {
+      Logger.log(`Error getting file path: ${JSON.stringify(data)}`);
+    }
+  } catch (e) {
+    Logger.log("Error getting Telegram file: " + e);
+  }
+  return null;
 }
 
 // =====================================================
