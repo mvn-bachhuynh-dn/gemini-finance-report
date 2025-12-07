@@ -128,8 +128,24 @@ function doPost(e) {
     }
 
     // Dispatch based on intent
-    const intent = parsed.intent;
-    const data = parsed.data || {};
+    // Dispatch based on intent
+    let intent = parsed.intent;
+    let data = parsed.data || {};
+
+    // FALLBACK: If model returns flat JSON (old format or hallucination)
+    if (!intent) {
+       if (parsed.amount && parsed.type) {
+          intent = "transaction";
+          data = parsed;
+          Logger.log("Fallback: Detected flat JSON transaction.");
+       } else if (parsed.report_type) {
+          intent = "report";
+          data = parsed;
+       } else {
+          intent = "chat";
+          Logger.log("Fallback: Defaulting to chat.");
+       }
+    }
 
     // --- CASE 1: REPORT ---
     if (intent === "report") {
@@ -148,7 +164,7 @@ function doPost(e) {
     // --- CASE 2: TRANSACTION ---
     if (intent === "transaction") {
       if (!data.amount || !data.type) {
-         sendMessage(chatId, "🤔 Hình như bạn muốn ghi giao dịch nhưng mình chưa rõ số tiền. Bạn nói lại rõ hơn nhé?");
+         sendMessage(chatId, "🤔 (v2) Hình như bạn muốn ghi giao dịch nhưng mình chưa rõ số tiền. Bạn nói lại rõ hơn nhé?");
          return HtmlService.createHtmlOutput("transaction unclear");
       }
       appendToSheet(data, msg.from.first_name || "User");
