@@ -1,15 +1,4 @@
 // =====================================================
-// CONFIGURATION
-// =====================================================
-const BOT_TOKEN  = 'YOUR_TELEGRAM_TOKEN';
-const GEMINI_KEY = 'YOUR_GEMINI_API_KEY';
-const SHEET_ID   = 'YOUR_SHEET_ID';
-const TG_API     = 'https://api.telegram.org/bot' + BOT_TOKEN;
-const ADMIN_CHAT_ID = 'YOUR_CHAT_ID';
-const REMIND_HOUR = 20;
-const REPORT_HOUR = 21;
-
-// =====================================================
 // WEBHOOK ENTRY POINT
 // =====================================================
 function doPost(e) {
@@ -153,6 +142,7 @@ function doPost(e) {
       switch (data.report_type) {
         case "day": reportContent = getFinanceReport("day"); break;
         case "month": reportContent = getFinanceReport("month"); break;
+        case "year": reportContent = getFinanceReport("year"); break;
         case "category": reportContent = getCategoryReport(); break;
         case "top_category": reportContent = getTopCategoryReport(); break;
         default: reportContent = getFinanceReport("all"); break;
@@ -171,6 +161,21 @@ function doPost(e) {
       const reply = `✅ Đã ghi: <b>${data.type}</b> ${data.amount.toLocaleString()}đ — ${data.note || ""}\n🏷️ Danh mục: <b>${data.category || "Khác"}</b>\n\n${parsed.reaction}`;
       sendMessage(chatId, reply, "HTML");
       return HtmlService.createHtmlOutput("ok transaction");
+    }
+
+    // --- CASE 3: DELETE ---
+    if (intent === "delete") {
+      if (!data.amount || !data.type) {
+        sendMessage(chatId, "🤔 Mình cần biết rõ số tiền và loại giao dịch (thu/chi) để xóa. Bạn nói rõ hơn nhé?");
+        return HtmlService.createHtmlOutput("delete unclear");
+      }
+      const success = deleteTransactionByCriteria(data);
+      if (success) {
+        sendMessage(chatId, `🗑️ ${parsed.reaction || "Đã xóa giao dịch!"}\n\nĐã xóa khoản <b>${data.type} ${data.amount.toLocaleString()}đ</b> gần nhất.`, "HTML");
+      } else {
+        sendMessage(chatId, `⚠️ Không tìm thấy giao dịch <b>${data.type} ${data.amount.toLocaleString()}đ</b> nào gần đây để xóa.`, "HTML");
+      }
+      return HtmlService.createHtmlOutput("ok delete");
     }
 
     // --- CASE 3: CHAT / OTHER ---
@@ -198,28 +203,34 @@ function parseAndReactWithGemini(text, userName, imageBlob = null) {
   Logger.log(`parseAndReactWithGemini called. User: ${userName}, Text: ${text}, Has Image: ${!!imageBlob}`);
   try {
     const prompt = `
-Bạn là "Bot Chi Tiêu Gemini", một trợ lý tài chính cá nhân thông minh, vui tính và hữu ích.
-Nhiệm vụ của bạn là phân tích tin nhắn của người dùng (và ảnh nếu có) để xác định xem họ muốn:
-1. Ghi chép giao dịch (thu/chi).
-2. Xem báo cáo tài chính.
-3. Trò chuyện xã giao bình thường.
+Bạn là "Bot Chi Tiêu Gemini", một trợ lý tài chính cá nhân thông minh, vui tính.
+Nhiệm vụ của bạn là phân tích tin nhắn người dùng (và ảnh) để xác định intent:
 
-Trả về kết quả dưới dạng JSON KHÔNG CÓ MARKDOWN (không dùng \`\`\`json).
-Cấu trúc JSON yêu cầu:
+1. \`transaction\`: Ghi chép thu/chi.
+2. \`report\`: Xem báo cáo (ngày/tháng/năm/danh mục).
+3. \`delete\`: Xóa giao dịch (ví dụ: "xóa khoản thu 120k").
+4. \`chat\`: Trò chuyện xã giao.
 
+Yêu cầu QUAN TRỌNG về JSON:
+- Trả về JSON thuần, KHÔNG dùng markdown \`\`\`json.
+- KHÔNG dùng dấu ngoặc kép (") bên trong giá trị chuỗi. Nếu cần, hãy dùng dấu nháy đơn (') hoặc escape (\\").
+- Ví dụ sai: "reaction": "Lucien muốn "dọn dẹp" sổ sách"
+- Ví dụ đúng: "reaction": "Lucien muốn 'dọn dẹp' sổ sách"
+
+Cấu trúc JSON:
 {
-  "intent": "transaction" | "report" | "chat",
+  "intent": "transaction" | "report" | "delete" | "chat",
   "data": {
-     // NẾU intent = "transaction":
-     "type": "thu" hoặc "chi",
-     "amount": số tiền (VNĐ, integer),
-     "note": "mô tả ngắn gọn nội dung chi tiêu",
-     "category": "danh mục (Ăn uống, Di chuyển, Mua sắm, Hóa đơn, Giải trí, Sức khỏe, Giáo dục, Đầu tư, Khác)"
+     // NẾU intent = "transaction" HOẶC "delete":
+     "type": "thu" | "chi",
+     "amount": số tiền (integer),
+     "note": "mô tả",
+     "category": "Danh mục chuẩn"
 
      // NẾU intent = "report":
-     "report_type": "day" | "month" | "all" | "category" | "top_category" (dựa vào ngữ cảnh thời gian user hỏi)
+     "report_type": "day" | "month" | "year" | "all" | "category" | "top_category"
   },
-  "reaction": "Câu trả lời của bạn với người dùng. Nếu là chat thì trả lời tự nhiên. Nếu là giao dịch/report thì trả lời xác nhận vui vẻ. Dùng nhiều emoji."
+  "reaction": "Câu trả lời vui vẻ. KHÔNG chứa dấu ngoặc kép không được escape."
 }
 
 Câu của người dùng: "${text}"
@@ -285,9 +296,21 @@ Tên người dùng: "${userName}"
       }
     }
 
+    // Aggressive JSON sanitization
+    // 1. Remove markdown code blocks if present
+    jsonString = jsonString.replace(/^```json\s*/, "").replace(/\s*```$/, "");
+    
+    // 2. Escape double quotes inside values if they aren't already escaped
+    // This is tricky with regex, so we rely more on the prompt instructions.
+    // However, we can try to fix common "reaction": "Hello "world"" issues?
+    // Let's trust the prompt update first, but maybe handle trailing commas.
+    
     try {
       return JSON.parse(jsonString.trim());
     } catch (parseErr) {
+       Logger.log("First JSON parse failed: " + parseErr + ". Raw: " + jsonString);
+       // Last ditch effort: try to strip invalid characters or fix simple quote issues
+       // But often better to return error so user knows AI failed
       return { error: "JSON Parse Error: " + parseErr.message, raw: raw };
     }
   } catch (e) {
@@ -402,13 +425,33 @@ function deleteLastTransaction() {
   }
 }
 
+function deleteTransactionByCriteria(criteria) {
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const sh = ss.getSheetByName("Transactions");
+  if (!sh || sh.getLastRow() <= 1) return false;
+
+  const data = sh.getDataRange().getValues();
+  // Search from bottom up
+  for (let i = data.length - 1; i >= 1; i--) {
+     const row = data[i];
+     // row[2] = type, row[3] = amount
+     // Loose equality for amount in case of string/number diff
+     if (row[2] == criteria.type && row[3] == criteria.amount) {
+        // Optional: Check category or note if provided? For now, Type + Amount is decent enough for "Delete 120k"
+        sh.deleteRow(i + 1); // 1-indexed
+        return true;
+     }
+  }
+  return false;
+}
+
 // =====================================================
 // REPORTING FUNCTIONS
 // =====================================================
 function getFinanceReport(mode = "all") {
   const ss = SpreadsheetApp.openById(SHEET_ID);
   const sh = ss.getSheetByName("Transactions");
-  if (!sh) return "⚠️ Chưa có dữ liệu nào.";
+  if (sh.getLastRow() <= 1) return "⚠️ Chưa có dữ liệu nào.";
   const data = sh.getDataRange().getValues();
   if (data.length <= 1) return "📭 Chưa ghi nhận giao dịch nào.";
 
@@ -422,14 +465,20 @@ function getFinanceReport(mode = "all") {
     const date = new Date(ts);
     if (mode === "day" && (date.getDate() !== d || date.getMonth() !== m || date.getFullYear() !== y)) continue;
     if (mode === "month" && (date.getMonth() !== m || date.getFullYear() !== y)) continue;
+    if (mode === "year" && (date.getFullYear() !== y)) continue;
+    
     if (type === "thu") totalThu += amt;
     if (type === "chi") totalChi += amt;
   }
 
   const balance = totalThu - totalChi;
   const emoji = balance >= 0 ? "🟢" : "🔴";
-  const title = mode === "day" ? "📅 <b>Báo cáo hôm nay</b>" : mode === "month" ? "🗓️ <b>Báo cáo tháng này</b>" : "📊 <b>Báo cáo tổng hợp</b>";
-  return `${title}\n\n💰 <b>Tổng thu:</b> ${totalThu.toLocaleString()}đ\n💸 <b>Tổng chi:</b> ${totalChi.toLocaleString()}đ\n${emoji} <b>Cân đối:</b> ${balance.toLocaleString()}đ\n\n${balance >= 0 ? "Tài chính ổn áp đó nha 😎" : "Chi hơi mạnh tay rồi 😅"}`;
+  let title = "📊 <b>Báo cáo tổng hợp</b>";
+  if (mode === "day") title = "📅 <b>Báo cáo hôm nay</b>";
+  if (mode === "month") title = "🗓️ <b>Báo cáo tháng này</b>";
+  if (mode === "year") title = "🎆 <b>Báo cáo năm nay</b>";
+
+  return `${title}\n\n💰 <b>Tổng thu:</b> ${totalThu.toLocaleString()}đ\n💸 <b>Tổng chi:</b> ${totalChi.toLocaleString()}đ\n${emoji} <b>Cân đối:</b> ${balance.toLocaleString()}đ`;
 }
 
 function getCategoryReport() {
