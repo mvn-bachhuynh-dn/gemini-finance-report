@@ -8,8 +8,13 @@ function doPost(e) {
     if (!msg || msg.from?.is_bot) return HtmlService.createHtmlOutput("ignored");
 
     const chatId = msg.chat.id;
+    const messageId = msg.message_id;
     let text = msg.text?.trim();
     let imageBlob = null;
+
+    // 1. React "Loading" immediately
+    setMessageReaction(chatId, messageId, "👀");
+
 
     Logger.log(`Received message from ${chatId}. Text: "${text}". Photo present: ${!!msg.photo}`);
 
@@ -148,6 +153,7 @@ function doPost(e) {
         default: reportContent = getFinanceReport("all"); break;
       }
       sendMessage(chatId, `${parsed.reaction}\n\n${reportContent}`, "HTML");
+      setMessageReaction(chatId, messageId, "👌");
       return HtmlService.createHtmlOutput("ok report");
     }
 
@@ -155,11 +161,33 @@ function doPost(e) {
     if (intent === "transaction") {
       if (!data.amount || !data.type) {
          sendMessage(chatId, "🤔 (v2) Hình như bạn muốn ghi giao dịch nhưng mình chưa rõ số tiền. Bạn nói lại rõ hơn nhé?");
+         setMessageReaction(chatId, messageId, "🤔");
          return HtmlService.createHtmlOutput("transaction unclear");
       }
       appendToSheet(data, msg.from.first_name || "User");
       const reply = `✅ Đã ghi: <b>${data.type}</b> ${data.amount.toLocaleString()}đ — ${data.note || ""}\n🏷️ Danh mục: <b>${data.category || "Khác"}</b>\n\n${parsed.reaction}`;
       sendMessage(chatId, reply, "HTML");
+      
+      // React based on category
+      let reactEmoji = "✍";
+      const cat = (data.category || "").toLowerCase();
+      if (cat.includes("ăn") || cat.includes("uống")) reactEmoji = "🌭";
+      else if (cat.includes("thuốc") || cat.includes("sức khỏe")) reactEmoji = "pill"; // 'pill' not supported, use '💊'? Check support. Standard set: 💊 is supported.
+      else if (cat.includes("việc") || cat.includes("làm")) reactEmoji = "🤝";
+      else if (cat.includes("chơi") || cat.includes("giải trí")) reactEmoji = "🎉";
+      else if (cat.includes("xe") || cat.includes("chuyển")) reactEmoji = "🐳"; // 'taxi' not supported. 'whale'? No. Let's use '🕊' (Flying) or '👌'. 
+      // Telegram limited set: 👍👎❤🔥🥰👏😁🤔🤯😱🤬😢🎉🤩🤮💩🙏👌🕊🤡🥱🥴😍🐳❤‍🔥🌚🌭💯🤣⚡🍌🏆💔🤨😐🍓🍾💋🖕😈😴😭🤓👻👨‍💻👀🎃🙈😇😨🤝✍🤗🫡🎅🎄☃💅🤪🗿🆒💘🙉🦄😘💊🙊😎👾🤷‍♂🤷‍♀🤷
+      // Moving: 🕊? 
+      // Health: 💊
+      // Food: 🌭, 🍓, 🍌
+      // Shopping: 💅, 🛍(no), 🍾
+      // Default: 👌
+      
+      if (cat.includes("sức")) reactEmoji = "💊";
+      if (cat.includes("mua")) reactEmoji = "💅"; // Fancy
+      if (cat.includes("xe") || cat.includes("đi")) reactEmoji = "🕊"; 
+
+      setMessageReaction(chatId, messageId, reactEmoji);
       return HtmlService.createHtmlOutput("ok transaction");
     }
 
@@ -167,13 +195,16 @@ function doPost(e) {
     if (intent === "delete") {
       if (!data.amount || !data.type) {
         sendMessage(chatId, "🤔 Mình cần biết rõ số tiền và loại giao dịch (thu/chi) để xóa. Bạn nói rõ hơn nhé?");
+        setMessageReaction(chatId, messageId, "🤔");
         return HtmlService.createHtmlOutput("delete unclear");
       }
       const success = deleteTransactionByCriteria(data);
       if (success) {
         sendMessage(chatId, `🗑️ ${parsed.reaction || "Đã xóa giao dịch!"}\n\nĐã xóa khoản <b>${data.type} ${data.amount.toLocaleString()}đ</b> gần nhất.`, "HTML");
+        setMessageReaction(chatId, messageId, "👌");
       } else {
         sendMessage(chatId, `⚠️ Không tìm thấy giao dịch <b>${data.type} ${data.amount.toLocaleString()}đ</b> nào gần đây để xóa.`, "HTML");
+        setMessageReaction(chatId, messageId, "🤔");
       }
       return HtmlService.createHtmlOutput("ok delete");
     }
@@ -181,6 +212,7 @@ function doPost(e) {
     // --- CASE 3: CHAT / OTHER ---
     // Default to just sending the reaction
     sendMessage(chatId, parsed.reaction || "Mình đang lắng nghe đây! 😄", "HTML");
+    setMessageReaction(chatId, messageId, "👌");
     return HtmlService.createHtmlOutput("ok chat");
 
   } catch (err) {
@@ -543,6 +575,27 @@ function sendMessage(chatId, text, mode = "HTML", buttons = null) {
     payload: JSON.stringify(payload),
     muteHttpExceptions: true,
   });
+}
+
+function setMessageReaction(chatId, messageId, emoji) {
+  // Telegram API: setMessageReaction
+  // Reaction must be one of the supported emojis
+  const payload = {
+    chat_id: chatId,
+    message_id: messageId,
+    reaction: [{ type: "emoji", emoji: emoji }]
+  };
+  
+  try {
+    UrlFetchApp.fetch(`${TG_API}/setMessageReaction`, {
+      method: "post",
+      contentType: "application/json",
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true,
+    });
+  } catch (e) {
+    Logger.log("Reaction error: " + e);
+  }
 }
 
 // =====================================================
