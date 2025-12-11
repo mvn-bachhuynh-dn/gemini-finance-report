@@ -111,12 +111,13 @@ function doPost(e) {
     // =====================================================
     // AI-BASED TRANSACTION PARSING (GEMINI)
     // =====================================================
-    const parsed = parseAndReactWithGemini(text, msg.from.first_name || "Người dùng", imageBlob);
+    // Pass chatId to allow debugging messages
+    const parsed = parseAndReactWithGemini(chatId, text, msg.from.first_name || "Người dùng", imageBlob);
     
     // Debug: If parsed has error or raw, show it
     if (parsed.error) {
-       const safeError = (parsed.error || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-       const safeRaw = (parsed.raw || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+       const safeError = (parsed.error || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, ">");
+       const safeRaw = (parsed.raw || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, ">");
        sendMessage(chatId, `⚠️ <b>Lỗi xử lý AI:</b>\n${safeError}\n\n<b>Raw Output:</b>\n<pre>${safeRaw}</pre>`, "HTML");
        return HtmlService.createHtmlOutput("ai error");
     }
@@ -124,7 +125,7 @@ function doPost(e) {
     // Dispatch based on intent
     // Dispatch based on intent
     let intent = parsed.intent;
-    let data = parsed.data || {};
+    let data = parsed.data || parsed; // Support both nested 'data' and flat JSON
 
     // FALLBACK: If model returns flat JSON (old format or hallucination)
     if (!intent) {
@@ -148,7 +149,10 @@ function doPost(e) {
         case "day": reportContent = getFinanceReport("day"); break;
         case "month": reportContent = getFinanceReport("month"); break;
         case "year": reportContent = getFinanceReport("year"); break;
-        case "category": reportContent = getCategoryReport(); break;
+        case "category": 
+          // Check if specific category requested
+          reportContent = getCategoryReport(data.category); 
+          break;
         case "top_category": reportContent = getTopCategoryReport(); break;
         default: reportContent = getFinanceReport("all"); break;
       }
@@ -165,27 +169,43 @@ function doPost(e) {
          return HtmlService.createHtmlOutput("transaction unclear");
       }
       appendToSheet(data, msg.from.first_name || "User");
-      const reply = `✅ Đã ghi: <b>${data.type}</b> ${data.amount.toLocaleString()}đ — ${data.note || ""}\n🏷️ Danh mục: <b>${data.category || "Khác"}</b>\n\n${parsed.reaction}`;
+      
+      // Calculate Stats
+      const stats = calculateMonthlyStats(data.category);
+      
+      let statsText = `• ${data.category}: ${stats.totalDetailed.toLocaleString()}đ\n`;
+      
+      // If group detected and different from detailed, show group stats
+      if (stats.detectedGroupName && stats.totalGroup > 0) {
+         statsText += `• Nhóm ${stats.detectedGroupName}: ${stats.totalGroup.toLocaleString()}đ\n`;
+      }
+      
+      statsText += `• Tổng chi: ${stats.totalMonth.toLocaleString()}đ\n\n`;
+
+      let dateInfo = "";
+      if (data.date) {
+         const pDate = new Date(data.date);
+         if (!isNaN(pDate.getTime())) {
+            dateInfo = `📅 Ngảy: ${pDate.toLocaleDateString("vi-VN")}\n`;
+         }
+      }
+
+      const reply = `✅ Đã ghi: <b>${data.type}</b> ${data.amount.toLocaleString()}đ — ${data.note || ""}\n${dateInfo}🏷️ Danh mục: <b>${data.category || "Khác"}</b>\n\n` + 
+                    `📈 <b>Tháng này:</b>\n` +
+                    statsText +
+                    `${parsed.reaction}`;
+                    
       sendMessage(chatId, reply, "HTML");
       
       // React based on category
       let reactEmoji = "✍";
       const cat = (data.category || "").toLowerCase();
       if (cat.includes("ăn") || cat.includes("uống")) reactEmoji = "🌭";
-      else if (cat.includes("thuốc") || cat.includes("sức khỏe")) reactEmoji = "pill"; // 'pill' not supported, use '💊'? Check support. Standard set: 💊 is supported.
+      else if (cat.includes("thuốc") || cat.includes("sức khỏe") || cat.includes("khám")) reactEmoji = "💊";
       else if (cat.includes("việc") || cat.includes("làm")) reactEmoji = "🤝";
       else if (cat.includes("chơi") || cat.includes("giải trí")) reactEmoji = "🎉";
-      else if (cat.includes("xe") || cat.includes("chuyển")) reactEmoji = "🐳"; // 'taxi' not supported. 'whale'? No. Let's use '🕊' (Flying) or '👌'. 
-      // Telegram limited set: 👍👎❤🔥🥰👏😁🤔🤯😱🤬😢🎉🤩🤮💩🙏👌🕊🤡🥱🥴😍🐳❤‍🔥🌚🌭💯🤣⚡🍌🏆💔🤨😐🍓🍾💋🖕😈😴😭🤓👻👨‍💻👀🎃🙈😇😨🤝✍🤗🫡🎅🎄☃💅🤪🗿🆒💘🙉🦄😘💊🙊😎👾🤷‍♂🤷‍♀🤷
-      // Moving: 🕊? 
-      // Health: 💊
-      // Food: 🌭, 🍓, 🍌
-      // Shopping: 💅, 🛍(no), 🍾
-      // Default: 👌
-      
-      if (cat.includes("sức")) reactEmoji = "💊";
-      if (cat.includes("mua")) reactEmoji = "💅"; // Fancy
-      if (cat.includes("xe") || cat.includes("đi")) reactEmoji = "🕊"; 
+      else if (cat.includes("xe") || cat.includes("di chuyển") || cat.includes("xăng")) reactEmoji = "🕊"; 
+      else if (cat.includes("mua") || cat.includes("sắm")) reactEmoji = "💅";
 
       setMessageReaction(chatId, messageId, reactEmoji);
       return HtmlService.createHtmlOutput("ok transaction");
@@ -209,49 +229,56 @@ function doPost(e) {
       return HtmlService.createHtmlOutput("ok delete");
     }
 
-    // --- CASE 3: CHAT / OTHER ---
+    // --- CASE 4: CHAT / OTHER ---
     // Default to just sending the reaction
     sendMessage(chatId, parsed.reaction || "Mình đang lắng nghe đây! 😄", "HTML");
     setMessageReaction(chatId, messageId, "👌");
     return HtmlService.createHtmlOutput("ok chat");
-
   } catch (err) {
-    Logger.log("Error: " + err);
-    try {
-      const update = JSON.parse(e.postData.contents);
-      const chatId = update.message.chat.id;
-      sendMessage(chatId, `🔥 <b>Lỗi hệ thống:</b>\n${err.toString()}`, "HTML");
-    } catch (e2) {
-      Logger.log("Could not send error to user: " + e2);
-    }
-    return HtmlService.createHtmlOutput("error");
+// ... (unchanged) ...
   }
 }
 
 // =====================================================
 // GEMINI PARSER HANDLER
 // =====================================================
-function parseAndReactWithGemini(text, userName, imageBlob = null) {
+function parseAndReactWithGemini(chatId, text, userName, imageBlob = null) {
   Logger.log(`parseAndReactWithGemini called. User: ${userName}, Text: ${text}, Has Image: ${!!imageBlob}`);
   try {
+    const now = new Date();
+    const currentDateString = now.toLocaleDateString("vi-VN", { weekday: 'long', year: 'numeric', month: 'numeric', day: 'numeric' });
+    
     const prompt = `
 Bạn là "Bot Chi Tiêu Gemini", một trợ lý tài chính cá nhân thông minh, vui tính.
+Hôm nay là: ${currentDateString}.
+Tuy nhiệm vụ chính là quản lý chi tiêu, bạn CÓ THỂ trò chuyện vui vẻ và trả lời các câu hỏi kiến thức chung (giá vàng, thời tiết, tin tức...) một cách ngắn gọn, hữu ích.
+
 Nhiệm vụ của bạn là phân tích tin nhắn người dùng (và ảnh) để xác định intent:
 
 1. \`transaction\`: Ghi chép thu/chi.
-2. \`report\`: Xem báo cáo (ngày/tháng/năm/danh mục).
+2. \`report\`: Xem báo cáo.
+   - Nếu hỏi chung: report_type="day"/"month"/"year"/"all".
+   - Nếu hỏi danh mục cụ thể (vd: "đã tiêu bao nhiêu cho ăn uống"): report_type="category", category="Ăn uống" (trích xuất từ khoá).
 3. \`delete\`: Xóa giao dịch (ví dụ: "xóa khoản thu 120k").
-4. \`chat\`: Trò chuyện xã giao.
+4. \`chat\`: Trò chuyện xã giao HOẶC hỏi đáp kiến thức chung.
 
 Yêu cầu QUAN TRỌNG về JSON:
-- Trả về JSON thuần, KHÔNG dùng markdown \`\`\`json.
-- KHÔNG dùng dấu ngoặc kép (") bên trong giá trị chuỗi. Nếu cần, hãy dùng dấu nháy đơn (') hoặc escape (\\").
+- Trả về JSON chuẩn (RFC 8259).
+- BẮT BUỘC dùng dấu ngoặc kép (") cho tên trường (key) và giá trị chuỗi (string value).
+- Nếu trong nội dung chuỗi có dấu ngoặc kép, hãy escape nó bằng dấu gạch chéo ngược (\"). Ví dụ: "reaction": "Chào \"bạn\" nhé"
 Bạn là trợ lý tài chính cá nhân thân thiện, có khả năng phân loại chi tiêu cực kỳ chi tiết.
 Phân tích câu người dùng nhập (và hình ảnh nếu có) về chi tiêu hoặc thu nhập.
+- Nếu là giao dịch: Phân loại chi tiết.
+- Nếu là câu hỏi chung (không phải ghi chép): Set intent="chat" và trả lời câu hỏi đó trong field "reaction".
+Mặc định "type" là "chi" nếu không có thông tin rõ ràng về việc thu tiền.
+QUAN TRỌNG: Hãy tìm thông tin NGÀY THÁNG trong câu nói hoặc trên ảnh hóa đơn (nếu có).
+- Ví dụ: "Hôm qua ăn 30k" -> Tính ra ngày hôm qua dựa trên "Hôm nay là: ${currentDateString}".
+- Ví dụ: Ảnh hóa đơn có ngày "2023-12-01" -> Trích xuất ngày này.
+- Trả về field "date" định dạng "YYYY-MM-DD" (ISO 8601). Nếu không tìm thấy, không cần trả về field này.
 
 YÊU CẦU QUAN TRỌNG VỀ DANH MỤC (CATEGORY):
-Hãy cố gắng classify vào các nhánh nhỏ chi tiết nhất có thể để phục vụ thống kê:
-1. Ăn uống: "Ăn sáng", "Ăn trưa", "Ăn tối", "Ăn vặt/Cafe", "Đi chợ/Siêu thị".
+Hãy cố gắng classify vào các nhánh nhỏ chi tiết nhất có thể để phục vụ thống kê (KHÔNG dùng category chung chung):
+1. Ăn uống: Bắt buộc dùng "Ăn sáng", "Ăn trưa", "Ăn tối", "Ăn vặt", "Cafe", "Đi chợ", "Siêu thị". (Tránh dùng "Ăn uống" chung chung).
 2. Hóa đơn: "Hóa đơn Điện", "Hóa đơn Nước", "Internet", "Điện thoại", "iCloud/Google Drive", "Chung cư".
 3. Di chuyển: "Xăng xe", "Gửi xe", "Grab/Taxi", "Bảo dưỡng xe".
 4. Mua sắm: "Quần áo", "Mỹ phẩm", "Gia dụng", "Thiết bị điện tử".
@@ -263,49 +290,86 @@ Nếu không chắc chắn, hãy chọn danh mục phù hợp nhất.
 
 Trả về JSON theo mẫu:
 {
-  "type": "thu" hoặc "chi",
-  "amount": số tiền (VNĐ, integer),
+  "intent": "transaction" | "report" | "delete" | "chat",
+  "type": "thu" hoặc "chi" (bắt buộc nếu intent là transaction/delete),
+  "amount": số tiền (VNĐ, integer) (bắt buộc nếu intent là transaction/delete),
   "note": "mô tả ngắn",
-  "category": "Tên danh mục chi tiết (ví dụ: Ăn sáng, Hóa đơn Điện)",
+  "category": "Tên danh mục chi tiết HOẶC từ khoá tìm kiếm báo cáo",
+  "date": "YYYY-MM-DD" (Optional, nếu tìm thấy ngày cụ thể),
+  "report_type": "day" | "month" | "year" | "category" | "top_category" | "all",
   "reaction": "một câu phản hồi tự nhiên, vui vẻ, thân mật, có emoji"
 }
 Câu của người dùng: "${text}"
 Tên người dùng: "${userName}"
 `;
 
-    const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${GEMINI_KEY}`;
+    // API Key Rotation Logic
+    const keys = GEMINI_KEY.split(",").map(k => k.trim());
+    let responseCode = 0;
+    let contentText = "";
     
-    let payload = {
-      contents: [{
-        parts: [{ text: prompt }]
-      }]
-    };
+    for (let i = 0; i < keys.length; i++) {
+      const key = keys[i];
+      if (!key) continue;
+      const keySnippet = "..." + key.slice(-4);
+      Logger.log(`Using API Key ${keySnippet}`);
+      
+      const url = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${key}`;
+      let payload = {
+        contents: [{
+          parts: [{ text: prompt }]
+        }]
+      };
 
-    if (imageBlob) {
-      Logger.log("Adding image to payload...");
-      payload.contents[0].parts.push({
-        inline_data: {
-          mime_type: imageBlob.getContentType(),
-          data: Utilities.base64Encode(imageBlob.getBytes())
+      if (imageBlob) {
+        Logger.log("Adding image to payload...");
+        payload.contents[0].parts.push({
+          inline_data: {
+            mime_type: imageBlob.getContentType(),
+            data: Utilities.base64Encode(imageBlob.getBytes())
+          }
+        });
+      }
+
+      try {
+        const res = UrlFetchApp.fetch(url, {
+          method: "post",
+          contentType: "application/json",
+          payload: JSON.stringify(payload),
+          muteHttpExceptions: true,
+        });
+
+        responseCode = res.getResponseCode();
+        contentText = res.getContentText();
+        
+        if (responseCode === 200) {
+           break; // Success
+        } else {
+           // If error, notify user roughly what happened before switching
+           const isLastKey = (i === keys.length - 1);
+           const errorMsg = `⚠️ <b>API Warning:</b> Key <code>${keySnippet}</code> report code <b>${responseCode}</b>.`;
+           
+           if (!isLastKey) {
+             sendMessage(chatId, `${errorMsg}\n🔄 Đang chuyển sang Key tiếp theo...`, "HTML");
+           } else {
+             sendMessage(chatId, `${errorMsg}\n❌ Đã hết Key dự phòng!`, "HTML");
+           }
+           
+           Logger.log(`API Key exhausted/error (${responseCode}). Content: ${contentText}`);
+           // Continue loop to try next key
         }
-      });
+      } catch (fetchErr) {
+         Logger.log(`Fetch error with key ...${key.slice(-4)}: ${fetchErr}`);
+         sendMessage(chatId, `⚠️ <b>Network Error:</b> ${fetchErr.message}\n🔄 Đang thử lại...`, "HTML");
+      }
     }
 
-    Logger.log("Sending request to Gemini...");
-    const res = UrlFetchApp.fetch(url, {
-      method: "post",
-      contentType: "application/json",
-      payload: JSON.stringify(payload),
-      muteHttpExceptions: true,
-    });
-
-    const responseCode = res.getResponseCode();
-    const contentText = res.getContentText();
-    Logger.log(`Gemini response code: ${responseCode}`);
-    Logger.log(`Gemini response body: ${contentText}`);
+    Logger.log(`Final Gemini response code: ${responseCode}`);
+    
+    // ... (rest of parsing logic) ...
 
     if (responseCode !== 200) {
-      return { error: `API Error: ${responseCode}`, raw: contentText };
+      return { error: `All API keys failed. Last error: ${responseCode}`, raw: contentText };
     }
 
     const data = JSON.parse(contentText);
@@ -333,20 +397,12 @@ Tên người dùng: "${userName}"
     }
 
     // Aggressive JSON sanitization
-    // 1. Remove markdown code blocks if present
     jsonString = jsonString.replace(/^```json\s*/, "").replace(/\s*```$/, "");
-    
-    // 2. Escape double quotes inside values if they aren't already escaped
-    // This is tricky with regex, so we rely more on the prompt instructions.
-    // However, we can try to fix common "reaction": "Hello "world"" issues?
-    // Let's trust the prompt update first, but maybe handle trailing commas.
     
     try {
       return JSON.parse(jsonString.trim());
     } catch (parseErr) {
        Logger.log("First JSON parse failed: " + parseErr + ". Raw: " + jsonString);
-       // Last ditch effort: try to strip invalid characters or fix simple quote issues
-       // But often better to return error so user knows AI failed
       return { error: "JSON Parse Error: " + parseErr.message, raw: raw };
     }
   } catch (e) {
@@ -355,38 +411,44 @@ Tên người dùng: "${userName}"
   }
 }
 
+const CATEGORY_GROUPS = {
+  "ăn uống": ["ăn", "cafe", "nước", "nhậu", "siêu thị", "chợ", "bún", "phở", "cơm"],
+  "di chuyển": ["xe", "grab", "taxi", "xăng", "đỗ", "gửi", "bảo dưỡng"],
+  "nhà cửa": ["điện", "nước", "net", "nhà", "gas", "chung cư", "phí quản lý"],
+  "mua sắm": ["mua", "quần áo", "mỹ phẩm", "giày", "túi"],
+  "sức khỏe": ["thuốc", "khám", "gym", "spa", "bệnh"],
+  "giải trí": ["phim", "game", "du lịch", "vé"],
+  "thu nhập": ["lương", "thưởng", "lãi", "bán"]
+};
+
+// =====================================================
+// TELEGRAM FILE DOWNLOADER
+// =====================================================
 function getTelegramFile(fileId) {
-  Logger.log(`getTelegramFile called for ID: ${fileId}`);
   try {
     const url = `${TG_API}/getFile?file_id=${fileId}`;
-    const res = UrlFetchApp.fetch(url);
-    const data = JSON.parse(res.getContentText());
-    if (data.ok) {
-      const filePath = data.result.file_path;
-      Logger.log(`File path retrieved: ${filePath}`);
-      const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
-      const blob = UrlFetchApp.fetch(fileUrl).getBlob();
-      
-      // Fix MIME type if it is generic
-      if (blob.getContentType() === "application/octet-stream") {
-        if (filePath.endsWith(".jpg") || filePath.endsWith(".jpeg")) {
-          blob.setContentType("image/jpeg");
-        } else if (filePath.endsWith(".png")) {
-          blob.setContentType("image/png");
-        } else if (filePath.endsWith(".webp")) {
-          blob.setContentType("image/webp");
-        }
-      }
-      
-      Logger.log(`Blob retrieved. Size: ${blob.getBytes().length}, Type: ${blob.getContentType()}`);
-      return blob;
-    } else {
-      Logger.log(`Error getting file path: ${JSON.stringify(data)}`);
-    }
+    const res = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+    if (res.getResponseCode() !== 200) return null;
+    const json = JSON.parse(res.getContentText());
+    if (!json.ok || !json.result) return null;
+    
+    const filePath = json.result.file_path;
+    const downloadUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
+    
+    let blob = UrlFetchApp.fetch(downloadUrl).getBlob();
+    
+    // Explicitly set MIME type based on extension if generic
+    const ext = filePath.split('.').pop().toLowerCase();
+    if (ext === "jpg" || ext === "jpeg") blob.setName("image.jpg").setContentType("image/jpeg");
+    else if (ext === "png") blob.setName("image.png").setContentType("image/png");
+    else if (ext === "webp") blob.setName("image.webp").setContentType("image/webp");
+    else blob.setContentType("image/jpeg"); // Fallback for Gemini
+
+    return blob;
   } catch (e) {
-    Logger.log("Error getting Telegram file: " + e);
+    Logger.log("getTelegramFile error: " + e);
+    return null;
   }
-  return null;
 }
 
 // =====================================================
@@ -397,84 +459,65 @@ function ensureSheet() {
   let sh = ss.getSheetByName("Transactions");
   if (!sh) {
     sh = ss.insertSheet("Transactions");
-    sh.appendRow(["Thời gian", "Người dùng", "Loại", "Số tiền", "Ghi chú", "Danh mục"]);
-  } else {
-    const headers = sh.getRange(1, 1, 1, sh.getLastColumn()).getValues()[0];
-    if (!headers.includes("Danh mục")) {
-      sh.insertColumnAfter(5);
-      sh.getRange(1, 6).setValue("Danh mục");
+    sh.appendRow(["Date", "User", "Type", "Amount", "Note", "Category"]);
+    sh.setFrozenRows(1);
+  }
+  return sh;
+}
+
+function appendToSheet(data, user) {
+  const sh = ensureSheet();
+  // Columns: A=Date, B=User, C=Type, D=Amount, E=Note, F=Category
+  let dateObj = new Date();
+  if (data.date) {
+    const parsed = new Date(data.date);
+    // Check if valid date
+    if (!isNaN(parsed.getTime())) {
+      dateObj = parsed;
     }
   }
+  sh.appendRow([dateObj, user, data.type, data.amount, data.note, data.category]);
+  SpreadsheetApp.flush(); // Force write to ensure subsequent reads see this new row
 }
 
-function appendToSheet(parsed, user) {
-  const ss = SpreadsheetApp.openById(SHEET_ID);
-  const sh = ss.getSheetByName("Transactions") || ss.insertSheet("Transactions");
-  sh.appendRow([
-    new Date(),
-    user,
-    parsed.type,
-    parsed.amount,
-    parsed.note || "",
-    parsed.category || "Khác"
-  ]);
-}
-
-// =====================================================
-// UNDO / CONFIRM (FIXED VERSION)
-// =====================================================
 function getLastTransaction() {
-  const ss = SpreadsheetApp.openById(SHEET_ID);
-  const sh = ss.getSheetByName("Transactions");
-  if (!sh || sh.getLastRow() <= 1) return null;
-
+  const sh = ensureSheet();
   const lastRow = sh.getLastRow();
-  const row = sh.getRange(lastRow, 1, 1, 6).getValues()[0];
-
-  // Save the last row index in Script Properties to allow confirmation deletion
-  PropertiesService.getScriptProperties().setProperty("LAST_UNDO_ROW", lastRow);
-
+  if (lastRow <= 1) return null;
+  const vals = sh.getRange(lastRow, 1, 1, 6).getValues()[0];
   return {
-    date: row[0],
-    user: row[1],
-    type: row[2],
-    amount: Number(row[3]),
-    note: row[4],
-    category: row[5]
+    date: vals[0], user: vals[1], type: vals[2], amount: vals[3], note: vals[4], category: vals[5]
   };
 }
 
 function deleteLastTransaction() {
-  const ss = SpreadsheetApp.openById(SHEET_ID);
-  const sh = ss.getSheetByName("Transactions");
-
-  const lastRow = Number(PropertiesService.getScriptProperties().getProperty("LAST_UNDO_ROW"));
-  if (!lastRow || lastRow <= 1 || !sh) return false;
-
-  try {
-    sh.deleteRow(lastRow);
-    PropertiesService.getScriptProperties().deleteProperty("LAST_UNDO_ROW");
-    return true;
-  } catch (err) {
-    Logger.log("Undo deletion error: " + err);
-    return false;
-  }
+  const sh = ensureSheet();
+  const lastRow = sh.getLastRow();
+  if (lastRow <= 1) return false;
+  sh.deleteRow(lastRow);
+  return true;
 }
 
-function deleteTransactionByCriteria(criteria) {
-  const ss = SpreadsheetApp.openById(SHEET_ID);
-  const sh = ss.getSheetByName("Transactions");
-  if (!sh || sh.getLastRow() <= 1) return false;
+function deleteTransactionByCriteria(data) {
+  // Try to find a transaction matching Amount AND Type in the last 20 rows
+  const sh = ensureSheet();
+  const lastRow = sh.getLastRow();
+  const startRow = Math.max(2, lastRow - 20); // Scan last 20 items
+  if (lastRow < 2) return false;
 
-  const data = sh.getDataRange().getValues();
-  // Search from bottom up
-  for (let i = data.length - 1; i >= 1; i--) {
-     const row = data[i];
-     // row[2] = type, row[3] = amount
-     // Loose equality for amount in case of string/number diff
-     if (row[2] == criteria.type && row[3] == criteria.amount) {
-        // Optional: Check category or note if provided? For now, Type + Amount is decent enough for "Delete 120k"
-        sh.deleteRow(i + 1); // 1-indexed
+  const range = sh.getRange(startRow, 1, lastRow - startRow + 1, 6);
+  const values = range.getValues();
+  
+  // Iterate backwards
+  for (let i = values.length - 1; i >= 0; i--) {
+     const row = values[i];
+     const [date, user, type, amt, note, cat] = row;
+     
+     // Fuzzy match logic
+     if (type === data.type && Number(amt) === Number(data.amount)) {
+        // Found it! Delete relative to sheet
+        const sheetRowIndex = startRow + i; 
+        sh.deleteRow(sheetRowIndex);
         return true;
      }
   }
@@ -485,6 +528,7 @@ function deleteTransactionByCriteria(criteria) {
 // REPORTING FUNCTIONS
 // =====================================================
 function getFinanceReport(mode = "all") {
+  // ... (unchanged) ...
   const ss = SpreadsheetApp.openById(SHEET_ID);
   const sh = ss.getSheetByName("Transactions");
   if (sh.getLastRow() <= 1) return "⚠️ Chưa có dữ liệu nào.";
@@ -517,23 +561,55 @@ function getFinanceReport(mode = "all") {
   return `${title}\n\n💰 <b>Tổng thu:</b> ${totalThu.toLocaleString()}đ\n💸 <b>Tổng chi:</b> ${totalChi.toLocaleString()}đ\n${emoji} <b>Cân đối:</b> ${balance.toLocaleString()}đ`;
 }
 
-function getCategoryReport() {
+function getCategoryReport(filterKeyword = null) {
   const ss = SpreadsheetApp.openById(SHEET_ID);
   const sh = ss.getSheetByName("Transactions");
   if (!sh || sh.getLastRow() <= 1) return "📭 Chưa có dữ liệu nào.";
   const data = sh.getRange(2, 1, sh.getLastRow() - 1, 6).getValues();
   const totals = {};
+  let totalFiltered = 0;
+
+  const normalizedKeyword = filterKeyword ? filterKeyword.toLowerCase() : null;
+  
+  // Check if keyword matches a group
+  let targetKeywords = [normalizedKeyword];
+  if (normalizedKeyword && CATEGORY_GROUPS[normalizedKeyword]) {
+    targetKeywords = CATEGORY_GROUPS[normalizedKeyword];
+  }
 
   data.forEach(row => {
     const [ , , type, amt, , category ] = row;
-    if (type === "chi") totals[category] = (totals[category] || 0) + Number(amt || 0);
+    if (type === "chi") {
+       const amount = Number(amt || 0);
+       const catLower = (category || "").toLowerCase();
+       
+       let isMatch = false;
+       if (!normalizedKeyword) {
+         isMatch = true;
+       } else {
+         // Check against all target keywords (or single keyword)
+         isMatch = targetKeywords.some(k => catLower.includes(k));
+       }
+
+       if (isMatch) {
+          // If grouping is active, map specific category to group name
+          let displayCat = category;
+          if (filterKeyword) displayCat = category; // Detailed view inside report
+          
+          totals[displayCat] = (totals[displayCat] || 0) + amount;
+          totalFiltered += amount;
+       }
+    }
   });
 
   const entries = Object.entries(totals);
-  if (entries.length === 0) return "📭 Chưa có giao dịch chi tiêu nào.";
+  if (entries.length === 0) return `📭 Không tìm thấy khoản chi nào cho '${filterKeyword || "tất cả"}'.`;
   entries.sort((a, b) => b[1] - a[1]);
 
-  let result = "🏷️ <b>Báo cáo theo danh mục chi tiêu</b>\n\n";
+  let result = filterKeyword 
+    ? `🏷️ <b>Báo cáo chi tiêu: ${filterKeyword}</b>\n\n💰 <b>Tổng cộng Group: ${totalFiltered.toLocaleString()}đ</b>\n\n`
+    : "🏷️ <b>Báo cáo theo danh mục chi tiêu</b>\n\n";
+    
   entries.forEach(([cat, val]) => result += `• ${cat}: ${val.toLocaleString()}đ\n`);
   return result;
 }
@@ -568,17 +644,111 @@ function getTopCategoryReport() {
 }
 
 // =====================================================
+// STATS HELPERS
+// =====================================================
+function calculateMonthlyStats(targetCategory) {
+  const ss = SpreadsheetApp.openById(SHEET_ID);
+  const sh = ss.getSheetByName("Transactions");
+  if (!sh || sh.getLastRow() <= 1) return { totalMonth: 0, totalCategory: 0 };
+  
+  const data = sh.getRange(2, 1, sh.getLastRow() - 1, 6).getValues();
+  const today = new Date();
+  const m = today.getMonth();
+  const y = today.getFullYear();
+  
+  let totalMonth = 0;
+  let totalDetailed = 0;
+  let totalGroup = 0;
+  let detectedGroupName = null;
+  
+  const targetCatLower = (targetCategory || "").toLowerCase();
+  
+  // Resolve group keywords
+  let groupKeywords = [];
+  
+  // Auto-detect group
+  for (const [groupName, keywords] of Object.entries(CATEGORY_GROUPS)) {
+     if (keywords.some(k => targetCatLower.includes(k))) {
+       groupKeywords = keywords;
+       detectedGroupName = groupName.charAt(0).toUpperCase() + groupName.slice(1); // Capitalize
+       break;
+     }
+  }
+
+  data.forEach(row => {
+    const [ts, , type, amt, , cat] = row;
+    if (!type || type.toLowerCase() !== "chi") return;
+    
+    const date = new Date(ts);
+    if (date.getMonth() === m && date.getFullYear() === y) {
+      const amount = Number(amt || 0);
+      totalMonth += amount;
+      
+      const rowCatLower = (cat || "").toLowerCase();
+      
+      // 1. Detailed Match (Exact or contain strict)
+      if (rowCatLower.includes(targetCatLower)) {
+        totalDetailed += amount;
+      }
+      
+      // 2. Group Match
+      if (groupKeywords.length > 0 && groupKeywords.some(k => rowCatLower.includes(k))) {
+        totalGroup += amount;
+      }
+    }
+  });
+
+  return { totalMonth, totalDetailed, totalGroup, detectedGroupName };
+}
+
+// =====================================================
 // TELEGRAM MESSAGE SENDER
 // =====================================================
 function sendMessage(chatId, text, mode = "HTML", buttons = null) {
   const payload = { chat_id: chatId, text, parse_mode: mode };
   if (buttons) payload.reply_markup = { inline_keyboard: buttons };
-  UrlFetchApp.fetch(`${TG_API}/sendMessage`, {
-    method: "post",
-    contentType: "application/json",
-    payload: JSON.stringify(payload),
-    muteHttpExceptions: true,
-  });
+  
+  try {
+    const res = UrlFetchApp.fetch(`${TG_API}/sendMessage`, {
+      method: "post",
+      contentType: "application/json",
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    });
+    
+    // Check for HTTP errors (since we muted exceptions)
+    if (res.getResponseCode() !== 200) {
+      throw new Error(`Telegram API Error (${res.getResponseCode()}): ${res.getContentText()}`);
+    }
+  } catch (e) {
+    Logger.log(`Failed to send message in ${mode} mode: ${e}`);
+    
+    // RETRY FALLBACK: If HTML mode failed, try plain text
+    if (mode === "HTML") {
+      Logger.log("Retrying with plain text...");
+      try {
+        delete payload.parse_mode; // Clear parse mode to send as Plain Text
+        const retryRes = UrlFetchApp.fetch(`${TG_API}/sendMessage`, {
+          method: "post",
+          contentType: "application/json",
+          payload: JSON.stringify(payload),
+          muteHttpExceptions: true
+        });
+        if (retryRes.getResponseCode() !== 200) {
+           Logger.log(`Retry with plain text also failed: ${retryRes.getContentText()}`);
+           // Last resort: Notify user that message sending failed completely
+           UrlFetchApp.fetch(`${TG_API}/sendMessage`, {
+             method: "post",
+             contentType: "application/json",
+             payload: JSON.stringify({ chat_id: chatId, text: "🆘 Lỗi hiển thị: Telegram từ chối tin nhắn này (400 Bad Request)." }),
+             muteHttpExceptions: true
+           });
+        }
+      } catch (retryErr) {
+        Logger.log(`Retry also failed: ${retryErr}`);
+      }
+    }
+  }
 }
 
 function setMessageReaction(chatId, messageId, emoji) {

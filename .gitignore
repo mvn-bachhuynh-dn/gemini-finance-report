@@ -5,3 +5,8 @@ Thumbs.db
 # Logs and temp files
 *.log
 *.tmp
+
+# Secret files
+secret.gs
+
+.clasp*
