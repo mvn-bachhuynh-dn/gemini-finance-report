@@ -9,6 +9,12 @@ function doPost(e) {
 
     const chatId = msg.chat.id;
     const messageId = msg.message_id;
+
+    // 0. Security Check: Restrict to Admin
+    if (String(chatId) !== String(ADMIN_CHAT_ID)) {
+      Logger.log(`⚠️ Unlimited Access Attempt: ${chatId} (Expected: ${ADMIN_CHAT_ID})`);
+      return HtmlService.createHtmlOutput("ignored");
+    }
     let text = msg.text?.trim();
     let imageBlob = null;
 
